@@ -1,4 +1,5 @@
 const INVENTORY_PAGE = "https://fortcollins.clscars.com/vehicles/";
+const INVENTORY_FEED = "https://fortcollins.clscars.com/wp-json/cls/v2/vehicles";
 
 const DEFAULT_PHONE = "720-595-0359";
 const DEFAULT_NAME = "Matt Goldie";
@@ -12,18 +13,16 @@ export default {
         ok: true,
         service: "Goldie Inventory Watcher",
         inventory: INVENTORY_PAGE,
+        feed: INVENTORY_FEED,
         schedule: "3:00 AM + 3:00 PM America/Denver",
       });
     }
 
     if (url.pathname === "/run") {
-
       try {
         const result = await checkInventory(env, {
-          manual: true,
           forceEmail: url.searchParams.get("force") === "1",
         });
-
         return json(result);
       } catch (error) {
         console.error(error);
@@ -31,33 +30,21 @@ export default {
       }
     }
 
-    if (url.pathname === "/debug-source") {
-      if (!env.ADMIN_KEY || url.searchParams.get("key") !== env.ADMIN_KEY) {
-        return new Response("Unauthorized", { status: 401 });
+    if (url.pathname === "/feed-test") {
+      try {
+        const response = await fetch(INVENTORY_FEED, { headers: browserHeaders() });
+        const data = await response.json();
+        const vehicles = normalizeClsFeed(data);
+
+        return json({
+          ok: true,
+          status: response.status,
+          detected: vehicles.length,
+          sample: vehicles.slice(0, 5),
+        });
+      } catch (error) {
+        return json({ ok: false, error: error.message }, 500);
       }
-
-      const response = await fetch(INVENTORY_PAGE, {
-        headers: browserHeaders(),
-      });
-
-      const html = await response.text();
-
-      const scripts = [
-        ...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi),
-      ].map((m) => absolutize(m[1], INVENTORY_PAGE));
-
-      const suspiciousUrls = [
-        ...html.matchAll(
-          /https?:\/\/[^\s"'<>]+(?:api|inventory|vehicle|feed)[^\s"'<>]*/gi
-        ),
-      ].map((m) => m[0]);
-
-      return json({
-        status: response.status,
-        htmlLength: html.length,
-        scripts: [...new Set(scripts)].slice(0, 100),
-        suspiciousUrls: [...new Set(suspiciousUrls)].slice(0, 100),
-      });
     }
 
     return new Response("Not Found", { status: 404 });
@@ -70,61 +57,42 @@ export default {
 
 async function runScheduledCheck(env) {
   const now = getDenverParts();
-
   if (now.minute !== 0) return;
   if (now.hour !== 3 && now.hour !== 15) return;
 
   const windowKey = `schedule:${now.year}-${now.month}-${now.day}-${now.hour}`;
   const alreadyRan = await env.INVENTORY_KV.get(windowKey);
-
   if (alreadyRan) return;
 
-  await env.INVENTORY_KV.put(windowKey, "1", {
-    expirationTtl: 172800,
-  });
-
+  await env.INVENTORY_KV.put(windowKey, "1", { expirationTtl: 172800 });
   await checkInventory(env);
 }
 
 async function checkInventory(env, options = {}) {
-  const vehicles = await fetchInventory(env);
+  if (!env.INVENTORY_KV) throw new Error("INVENTORY_KV binding is missing.");
 
-  if (!vehicles.length) {
-    throw new Error(
-      "No vehicles were detected. The CLS site loads inventory dynamically, so INVENTORY_FEED_URL may need to be configured."
-    );
-  }
+  const vehicles = await fetchInventory();
+  if (!vehicles.length) throw new Error("CLS inventory feed returned no usable vehicles.");
 
   const initialized = await env.INVENTORY_KV.get("inventory_initialized");
 
   if (!initialized) {
-    for (const vehicle of vehicles) {
-      await saveVehicle(env, vehicle);
-    }
+    for (const vehicle of vehicles) await saveVehicle(env, vehicle);
 
-    await env.INVENTORY_KV.put(
-      "inventory_initialized",
-      new Date().toISOString()
-    );
+    await env.INVENTORY_KV.put("inventory_initialized", new Date().toISOString());
 
     await sendEmail(env, {
       subject: `Goldie Inventory Watcher is live — ${vehicles.length} vehicles saved`,
-      html: `
-        <div style="font-family:Arial,sans-serif;line-height:1.5">
-          <h2>Goldie Inventory Watcher is live ✅</h2>
-          <p>I found <strong>${vehicles.length}</strong> vehicles currently in CLS inventory.</p>
-          <p>Those vehicles have been saved as the starting baseline. You will not receive alerts for existing units.</p>
-          <p>Starting now, newly added inventory will generate a fresh Marketplace-ready post.</p>
-          <p>Schedule: <strong>3:00 AM + 3:00 PM Mountain Time</strong></p>
-        </div>
-      `,
+      html: `<div style="font-family:Arial,sans-serif;line-height:1.5;max-width:700px;margin:auto;">
+        <h2>Goldie Inventory Watcher is live ✅</h2>
+        <p>I found <strong>${vehicles.length}</strong> vehicles currently in CLS inventory.</p>
+        <p>Those vehicles have been saved as the starting baseline.</p>
+        <p>Starting now, newly added inventory will generate its own Marketplace-ready email.</p>
+        <p><strong>Schedule:</strong> 3:00 AM + 3:00 PM Mountain Time</p>
+      </div>`,
     });
 
-    return {
-      ok: true,
-      baselineCreated: true,
-      vehicleCount: vehicles.length,
-    };
+    return { ok: true, baselineCreated: true, vehicleCount: vehicles.length };
   }
 
   const newVehicles = [];
@@ -133,298 +101,160 @@ async function checkInventory(env, options = {}) {
     const key = vehicleStorageKey(vehicle);
     const existing = await env.INVENTORY_KV.get(key);
 
-    if (!existing || options.forceEmail) {
-      newVehicles.push(vehicle);
-    }
-
+    if (!existing || options.forceEmail) newVehicles.push(vehicle);
     await saveVehicle(env, vehicle);
   }
 
   if (!newVehicles.length) {
-    return {
-      ok: true,
-      checked: vehicles.length,
-      newVehicles: 0,
-    };
+    return { ok: true, checked: vehicles.length, newVehicles: 0, message: "No new vehicles found." };
   }
 
   for (const vehicle of newVehicles) {
-    const post = generateMarketplacePost(vehicle);
-    await sendVehicleEmail(env, vehicle, post);
+    await sendVehicleEmail(env, vehicle, generateMarketplacePost(vehicle));
   }
 
   return {
     ok: true,
     checked: vehicles.length,
     newVehicles: newVehicles.length,
-    vehicles: newVehicles.map((v) => ({
-      vin: v.vin,
-      title: vehicleTitle(v),
-      price: v.price,
+    vehicles: newVehicles.map((vehicle) => ({
+      id: vehicle.id,
+      stock: vehicle.stock,
+      title: vehicleTitle(vehicle),
+      price: vehicle.price,
+      mileage: vehicle.mileage,
     })),
   };
 }
 
-async function fetchInventory(env) {
-  if (env.INVENTORY_FEED_URL) {
-    return fetchInventoryFeed(env.INVENTORY_FEED_URL);
-  }
-
-  return fetchInventoryFromPage();
-}
-
-async function fetchInventoryFeed(feedUrl) {
-  const response = await fetch(feedUrl, {
-    headers: browserHeaders(),
-  });
+async function fetchInventory() {
+  const response = await fetch(INVENTORY_FEED, { headers: browserHeaders() });
 
   if (!response.ok) {
-    throw new Error(
-      `Inventory feed returned ${response.status}: ${response.statusText}`
-    );
+    throw new Error(`CLS inventory feed returned ${response.status}: ${response.statusText}`);
   }
 
-  const contentType = response.headers.get("content-type") || "";
-
-  if (contentType.includes("json")) {
-    return normalizeJsonFeed(await response.json());
-  }
-
-  const text = await response.text();
-
-  try {
-    return normalizeJsonFeed(JSON.parse(text));
-  } catch {
-    return parseVehiclesFromHtml(text, feedUrl);
-  }
+  return normalizeClsFeed(await response.json());
 }
 
-async function fetchInventoryFromPage() {
-  const response = await fetch(INVENTORY_PAGE, {
-    headers: browserHeaders(),
-  });
-
-  if (!response.ok) {
-    throw new Error(
-      `CLS inventory page returned ${response.status}: ${response.statusText}`
-    );
-  }
-
-  const html = await response.text();
-  return parseVehiclesFromHtml(html, INVENTORY_PAGE);
-}
-
-function parseVehiclesFromHtml(html, baseUrl) {
+function normalizeClsFeed(data) {
   const vehicles = [];
-
-  const jsonLdBlocks = [
-    ...html.matchAll(
-      /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
-    ),
-  ];
-
-  for (const block of jsonLdBlocks) {
-    try {
-      const parsed = JSON.parse(block[1].trim());
-      extractVehicleObjects(parsed, vehicles);
-    } catch {}
-  }
-
-  const vehicleLinkMatches = [
-    ...html.matchAll(
-      /href=["']([^"']*(?:vehicle|vehicles|inventory)[^"']*)["']/gi
-    ),
-  ];
-
-  for (const match of vehicleLinkMatches) {
-    const url = absolutize(match[1], baseUrl);
-
-    if (!url || url === INVENTORY_PAGE) continue;
-
-    const vinMatch = url.match(/\b[A-HJ-NPR-Z0-9]{17}\b/i);
-
-    if (!vinMatch) continue;
-
-    vehicles.push({
-      vin: vinMatch[0].toUpperCase(),
-      url,
-    });
-  }
-
+  walkForResources(data, vehicles);
   return dedupeVehicles(vehicles);
 }
 
-function extractVehicleObjects(value, output) {
+function walkForResources(value, output) {
   if (!value) return;
 
   if (Array.isArray(value)) {
-    value.forEach((item) => extractVehicleObjects(item, output));
+    for (const item of value) walkForResources(item, output);
     return;
   }
 
   if (typeof value !== "object") return;
 
-  const type = Array.isArray(value["@type"])
-    ? value["@type"].join(" ")
-    : value["@type"];
-
-  if (
-    /vehicle|car|product/i.test(type || "") ||
-    value.vehicleIdentificationNumber ||
-    value.vin
-  ) {
-    const vehicle = normalizeVehicleObject(value);
-
-    if (vehicle.vin || vehicle.url) {
-      output.push(vehicle);
+  if (Array.isArray(value.resources)) {
+    for (const raw of value.resources) {
+      const vehicle = normalizeClsVehicle(raw);
+      if (vehicle && (vehicle.id || vehicle.stock || vehicle.url)) output.push(vehicle);
     }
   }
 
-  Object.values(value).forEach((child) =>
-    extractVehicleObjects(child, output)
-  );
+  for (const [key, child] of Object.entries(value)) {
+    if (key !== "resources") walkForResources(child, output);
+  }
 }
 
-function normalizeJsonFeed(data) {
-  const candidates = [];
-  collectObjects(data, candidates);
+function normalizeClsVehicle(raw) {
+  if (!raw || typeof raw !== "object") return null;
 
-  return dedupeVehicles(
-    candidates
-      .map(normalizeVehicleObject)
-      .filter((vehicle) => vehicle.vin || vehicle.url)
-  );
+  const title = cleanText(raw.post_title || raw.title || raw.name || "");
+  const parsedTitle = parseVehicleTitle(title);
+
+  return {
+    id: cleanText(raw.ID || raw.id),
+    vin: cleanText(raw.vin || raw.VIN),
+    stock: cleanText(raw.stock || raw.stock_number || raw.stockNumber) || extractStockFromSlug(raw.post_name),
+    year: cleanText(raw.year) || parsedTitle.year,
+    make: cleanText(raw.make) || parsedTitle.make,
+    model: cleanText(raw.model) || parsedTitle.model,
+    trim: cleanText(raw.trim),
+    price: normalizePrice(raw.price ?? raw.sale_price ?? raw.internet_price),
+    mileage: normalizeMileage(raw.miles ?? raw.mileage ?? raw.odometer),
+    drivetrain: cleanText(raw.drivetrain || raw.drive_train || raw.drive),
+    exteriorColor: cleanText(raw.exterior_color || raw.exteriorColor || raw.color),
+    bodyStyle: cleanText(raw.body_style || raw.bodyStyle || raw.body_type),
+    url: cleanUrl(raw.link || raw.guid || raw.url),
+    images: extractImages(raw),
+    rawTitle: title,
+  };
 }
 
-function collectObjects(value, output) {
+function extractImages(raw) {
+  const found = [];
+  for (const candidate of [
+    raw.media_url, raw.image, raw.image_url, raw.featured_image,
+    raw.thumbnail, raw.photos, raw.images, raw.gallery
+  ]) collectImageUrls(candidate, found);
+
+  return [...new Set(found.filter(Boolean))];
+}
+
+function collectImageUrls(value, output) {
   if (!value) return;
 
-  if (Array.isArray(value)) {
-    value.forEach((item) => collectObjects(item, output));
+  if (typeof value === "string") {
+    if (/^https?:\/\//i.test(value)) output.push(value);
     return;
   }
 
-  if (typeof value !== "object") return;
-
-  const looksVehicleLike =
-    value.vin ||
-    value.VIN ||
-    value.vehicleIdentificationNumber ||
-    value.stock ||
-    value.stockNumber ||
-    value.make ||
-    value.model ||
-    value.year ||
-    value.vehicle;
-
-  if (looksVehicleLike) {
-    output.push(value);
+  if (Array.isArray(value)) {
+    for (const item of value) collectImageUrls(item, output);
+    return;
   }
 
-  Object.values(value).forEach((child) =>
-    collectObjects(child, output)
-  );
+  if (typeof value === "object") {
+    const direct = value.url || value.src || value.media_url || value.full || value.large;
+    if (typeof direct === "string" && /^https?:\/\//i.test(direct)) output.push(direct);
+    for (const child of Object.values(value)) collectImageUrls(child, output);
+  }
 }
 
-function normalizeVehicleObject(raw) {
-  const offers = raw.offers || {};
-  const brand =
-    typeof raw.brand === "object" ? raw.brand?.name : raw.brand;
+function parseVehicleTitle(title) {
+  const parts = String(title || "").replace(/\s+/g, " ").trim().split(" ");
+  const yearIndex = parts.findIndex((part) => /^(19|20)\d{2}$/.test(part));
 
-  let images =
-    raw.images ||
-    raw.image ||
-    raw.photos ||
-    raw.photoUrls ||
-    raw.imageUrls ||
-    [];
-
-  if (!Array.isArray(images)) images = [images];
-
-  images = images
-    .map((img) => {
-      if (typeof img === "string") return img;
-      return img?.url || img?.contentUrl || null;
-    })
-    .filter(Boolean);
-
-  const title =
-    pick(raw.title, raw.name, raw.vehicleName, raw.descriptionTitle) || "";
-
-  let year = pick(raw.year, raw.modelYear, raw.vehicleModelDate);
-  let make = pick(raw.make, raw.manufacturer, brand);
-  let model = pick(raw.model, raw.vehicleModel);
-  let trim = pick(raw.trim, raw.trimLevel, raw.series);
-
-  if ((!year || !make || !model) && title) {
-    const parsed = parseTitle(title);
-    year ||= parsed.year;
-    make ||= parsed.make;
-    model ||= parsed.model;
+  if (yearIndex === -1) {
+    return { year: null, make: null, model: title || null };
   }
 
-  return cleanVehicle({
-    vin: pick(raw.vin, raw.VIN, raw.vehicleIdentificationNumber),
-    stock: pick(raw.stock, raw.stockNumber, raw.stock_number),
-    year,
-    make,
-    model,
-    trim,
-    price: normalizePrice(
-      pick(raw.price, raw.salePrice, raw.internetPrice, raw.listPrice, offers.price)
-    ),
-    mileage: normalizeMileage(
-      pick(raw.mileage, raw.odometer, raw.miles)
-    ),
-    drivetrain: pick(raw.drivetrain, raw.driveTrain, raw.drive),
-    exteriorColor: pick(raw.exteriorColor, raw.color, raw.exterior_color),
-    bodyStyle: pick(raw.bodyStyle, raw.bodyType, raw.type),
-    url: pick(raw.url, raw.vehicleUrl, raw.detailUrl),
-    images,
-  });
+  return {
+    year: parts[yearIndex] || null,
+    make: parts[yearIndex + 1] || null,
+    model: parts.slice(yearIndex + 2).join(" ") || null,
+  };
 }
 
-function cleanVehicle(vehicle) {
-  if (vehicle.vin) {
-    vehicle.vin = String(vehicle.vin).trim().toUpperCase();
-  }
-
-  for (const key of [
-    "year",
-    "make",
-    "model",
-    "trim",
-    "stock",
-    "drivetrain",
-    "exteriorColor",
-    "bodyStyle",
-  ]) {
-    if (vehicle[key] !== undefined && vehicle[key] !== null) {
-      vehicle[key] = String(vehicle[key]).trim();
-    }
-  }
-
-  return vehicle;
+function extractStockFromSlug(slug) {
+  if (!slug) return null;
+  const match = String(slug).match(/(?:-|_)([A-Za-z0-9]+)$/);
+  return match ? match[1] : null;
 }
 
 function dedupeVehicles(vehicles) {
   const map = new Map();
 
   for (const vehicle of vehicles) {
-    const key = vehicle.vin || vehicle.stock || vehicle.url;
+    const key = vehicle.vin || vehicle.stock || vehicle.id || vehicle.url;
     if (!key) continue;
 
-    const current = map.get(key) || {};
+    const normalizedKey = String(key).toUpperCase();
+    const current = map.get(normalizedKey) || {};
 
-    map.set(key, {
+    map.set(normalizedKey, {
       ...current,
       ...vehicle,
-      images: [
-        ...new Set([
-          ...(current.images || []),
-          ...(vehicle.images || []),
-        ]),
-      ],
+      images: [...new Set([...(current.images || []), ...(vehicle.images || [])])],
     });
   }
 
@@ -432,19 +262,14 @@ function dedupeVehicles(vehicles) {
 }
 
 async function saveVehicle(env, vehicle) {
-  const key = vehicleStorageKey(vehicle);
-
   await env.INVENTORY_KV.put(
-    key,
-    JSON.stringify({
-      ...vehicle,
-      lastSeen: new Date().toISOString(),
-    })
+    vehicleStorageKey(vehicle),
+    JSON.stringify({ ...vehicle, lastSeen: new Date().toISOString() })
   );
 }
 
 function vehicleStorageKey(vehicle) {
-  const identifier = vehicle.vin || vehicle.stock || vehicle.url;
+  const identifier = vehicle.vin || vehicle.stock || vehicle.id || vehicle.url;
   return `vehicle:${String(identifier).toUpperCase()}`;
 }
 
@@ -452,15 +277,10 @@ function generateMarketplacePost(vehicle) {
   const title = vehicleTitle(vehicle);
   const hook = getVehicleHook(vehicle);
 
-  const lines = [
-    hook,
-    "",
-    `${title} just became available!`,
-    "",
-  ];
+  const lines = [hook, "", `${title} just became available!`, ""];
 
   if (vehicle.price) lines.push(`💰 ${formatPrice(vehicle.price)}`);
-  if (vehicle.mileage) {
+  if (vehicle.mileage !== null && vehicle.mileage !== undefined) {
     lines.push(`🛣 ${formatMileage(vehicle.mileage)} miles`);
   }
   if (vehicle.exteriorColor) lines.push(`🎨 ${vehicle.exteriorColor}`);
@@ -483,32 +303,29 @@ function generateMarketplacePost(vehicle) {
 
 function getVehicleHook(vehicle) {
   const text = [
-    vehicle.make,
-    vehicle.model,
-    vehicle.trim,
-    vehicle.bodyStyle,
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
+    vehicle.make, vehicle.model, vehicle.trim, vehicle.bodyStyle, vehicle.rawTitle
+  ].filter(Boolean).join(" ").toLowerCase();
 
-  const seed = hashString(
-    vehicle.vin || vehicle.stock || vehicleTitle(vehicle)
-  );
-
+  const seed = hashString(vehicle.vin || vehicle.stock || vehicle.id || vehicleTitle(vehicle));
   let hooks;
 
-  if (/suburban|yukon xl|expedition max|wagoneer|grand wagoneer/.test(text)) {
+  if (/suburban|yukon xl|expedition max|grand wagoneer|wagoneer/.test(text)) {
     hooks = [
-      "Looking for a bigger vehicle? 👀",
+      "Looking for a bigger vehicle? 🚗",
       "Need room for everybody — and everything? 🚙",
       "If space is at the top of your list, check this one out 👀",
     ];
   } else if (/tahoe|yukon|expedition|sequoia|armada/.test(text)) {
     hooks = [
-      "Need the space without giving up capability? 👀",
       "Looking for a full-size SUV? 🚙",
+      "Need the space without giving up capability? 👀",
       "Family hauler, road-trip machine, daily driver — this checks a lot of boxes 👀",
+    ];
+  } else if (/telluride|palisade|highlander|pilot|traverse|explorer|pathfinder|grand cherokee l|atlas|cx-90/.test(text)) {
+    hooks = [
+      "Need three rows without going full-size? 🚙",
+      "Looking for something the whole family can fit in? 👀",
+      "Need more room for the family without driving a bus? 😂",
     ];
   } else if (/tacoma|colorado|canyon|ranger|frontier|ridgeline|maverick/.test(text)) {
     hooks = [
@@ -522,11 +339,23 @@ function getVehicleHook(vehicle) {
       "Need something that can work during the week and play on the weekend? 👀",
       "Truck people — this one just hit inventory 🛻",
     ];
+  } else if (/f-250|f-350|2500|3500|super duty|duramax|cummins/.test(text)) {
+    hooks = [
+      "Need a serious truck? 🛻",
+      "Looking for something built to work? 👀",
+      "If towing and capability matter, take a look at this one 🛻",
+    ];
   } else if (/corvette|supra|mustang|camaro|challenger|911|cayman|m3|m4|amg/.test(text)) {
     hooks = [
       "Okay… this one probably doesn't need much of an introduction. 😮‍💨",
       "Looking for something a little more fun? 👀",
       "This is definitely not your average commuter 😮‍💨",
+    ];
+  } else if (/escalade|denali|range rover|lexus|mercedes|bmw|audi|genesis/.test(text)) {
+    hooks = [
+      "Looking for something a little more luxurious? ✨",
+      "Want the comfort without giving up the style? 👀",
+      "Need the space but don't want to give up the luxury? 👀",
     ];
   } else if (/prius|camry|corolla|civic|accord|elantra|sonata|sentra|altima/.test(text)) {
     hooks = [
@@ -555,38 +384,25 @@ function getVehicleHook(vehicle) {
 async function sendVehicleEmail(env, vehicle, post) {
   const title = vehicleTitle(vehicle);
 
-  const imageHtml = (vehicle.images || [])
-    .slice(0, 12)
-    .map(
-      (url) => `
-        <a href="${escapeHtml(url)}" style="display:inline-block;margin:4px;">
-          <img src="${escapeHtml(url)}" width="180" style="border-radius:8px;display:block;" />
-        </a>
-      `
-    )
-    .join("");
+  const imageHtml = (vehicle.images || []).slice(0, 12).map(
+    (url) => `<a href="${escapeHtml(url)}" style="display:inline-block;margin:4px;">
+      <img src="${escapeHtml(url)}" width="180" style="border-radius:8px;display:block;" />
+    </a>`
+  ).join("");
 
-  const photoLinks = (vehicle.images || [])
-    .slice(0, 12)
-    .map(
-      (url, i) =>
-        `<a href="${escapeHtml(url)}">Photo ${i + 1}</a>`
-    )
-    .join(" &nbsp; ");
+  const photoLinks = (vehicle.images || []).slice(0, 12).map(
+    (url, index) => `<a href="${escapeHtml(url)}">Photo ${index + 1}</a>`
+  ).join(" &nbsp; ");
 
-  const detailLines = [
-    ["VIN", vehicle.vin],
+  const detailRows = [
     ["Stock", vehicle.stock],
+    ["VIN", vehicle.vin],
     ["Price", vehicle.price ? formatPrice(vehicle.price) : null],
-    ["Mileage", vehicle.mileage ? `${formatMileage(vehicle.mileage)} miles` : null],
+    ["Mileage", vehicle.mileage !== null && vehicle.mileage !== undefined ? `${formatMileage(vehicle.mileage)} miles` : null],
     ["Drivetrain", vehicle.drivetrain],
     ["Color", vehicle.exteriorColor],
-  ]
-    .filter(([, value]) => value)
-    .map(
-      ([label, value]) =>
-        `<strong>${label}:</strong> ${escapeHtml(value)}`
-    )
+  ].filter(([, value]) => value)
+    .map(([label, value]) => `<strong>${label}:</strong> ${escapeHtml(value)}`)
     .join("<br>");
 
   const vehicleLink = vehicle.url
@@ -595,56 +411,25 @@ async function sendVehicleEmail(env, vehicle, post) {
 
   await sendEmail(env, {
     subject: `NEW INVENTORY — ${title}`,
-    html: `
-      <div style="font-family:Arial,sans-serif;max-width:750px;margin:auto;line-height:1.5">
-        <h2>🚨 NEW INVENTORY — NOT POSTED</h2>
-        <h3>${escapeHtml(title)}</h3>
-        <p>${detailLines}</p>
-
-        ${vehicleLink}
-
-        ${
-          imageHtml
-            ? `
-          <h3>Vehicle Photos</h3>
-          <div>${imageHtml}</div>
-          <p>${photoLinks}</p>
-        `
-            : ""
-        }
-
-        <hr style="margin:30px 0">
-
-        <h3>Facebook Marketplace Copy</h3>
-
-        <div style="
-          white-space:pre-wrap;
-          background:#f4f4f4;
-          border-radius:10px;
-          padding:18px;
-          font-size:16px;
-        ">${escapeHtml(post)}</div>
-
-        <p style="margin-top:25px;color:#666">
-          Copy the post above into Facebook Marketplace.
-        </p>
-      </div>
-    `,
+    html: `<div style="font-family:Arial,sans-serif;max-width:760px;margin:auto;line-height:1.5">
+      <h2>🚨 NEW INVENTORY — NOT POSTED</h2>
+      <h3>${escapeHtml(title)}</h3>
+      <p>${detailRows}</p>
+      ${vehicleLink}
+      ${imageHtml ? `<h3>Vehicle Photos</h3><div>${imageHtml}</div><p>${photoLinks}</p>` : `<p><em>No vehicle photo URLs were supplied by the inventory feed.</em></p>`}
+      <hr style="margin:30px 0">
+      <h3>Facebook Marketplace Copy</h3>
+      <div style="white-space:pre-wrap;background:#f4f4f4;border-radius:10px;padding:18px;font-size:16px;">${escapeHtml(post)}</div>
+      <p style="margin-top:25px;color:#666;">Copy the post above into Facebook Marketplace.</p>
+    </div>`,
   });
 }
 
 async function sendEmail(env, { subject, html }) {
-  if (!env.RESEND_API_KEY) {
-    throw new Error("RESEND_API_KEY is missing.");
-  }
+  if (!env.RESEND_API_KEY) throw new Error("RESEND_API_KEY is missing from Cloudflare.");
+  if (!env.ALERT_EMAIL) throw new Error("ALERT_EMAIL is missing from Cloudflare.");
 
-  if (!env.ALERT_EMAIL) {
-    throw new Error("ALERT_EMAIL is missing.");
-  }
-
-  const from =
-    env.FROM_EMAIL ||
-    "Goldie Inventory <onboarding@resend.dev>";
+  const from = env.FROM_EMAIL || "Goldie Inventory <onboarding@resend.dev>";
 
   const response = await fetch("https://api.resend.com/emails", {
     method: "POST",
@@ -663,24 +448,21 @@ async function sendEmail(env, { subject, html }) {
   const result = await response.json();
 
   if (!response.ok) {
-    throw new Error(
-      result?.message ||
-      `Resend returned HTTP ${response.status}`
-    );
+    throw new Error(result?.message || `Resend returned HTTP ${response.status}`);
   }
 
   return result;
 }
 
 function vehicleTitle(vehicle) {
-  return [
-    vehicle.year,
-    vehicle.make,
-    vehicle.model,
-    vehicle.trim,
-  ]
+  return [vehicle.year, vehicle.make, vehicle.model, vehicle.trim]
     .filter(Boolean)
-    .join(" ") || vehicle.vin || "New Vehicle";
+    .join(" ")
+    .trim() ||
+    vehicle.rawTitle ||
+    vehicle.stock ||
+    vehicle.id ||
+    "New Vehicle";
 }
 
 function getDenverParts() {
@@ -695,8 +477,7 @@ function getDenverParts() {
   });
 
   const pieces = Object.fromEntries(
-    formatter
-      .formatToParts(new Date())
+    formatter.formatToParts(new Date())
       .filter((part) => part.type !== "literal")
       .map((part) => [part.type, part.value])
   );
@@ -710,75 +491,54 @@ function getDenverParts() {
   };
 }
 
-function parseTitle(title) {
-  const words = title.trim().split(/\s+/);
-  const yearIndex = words.findIndex((word) =>
-    /^(19|20)\d{2}$/.test(word)
-  );
-
-  if (yearIndex === -1) return {};
-
-  return {
-    year: words[yearIndex],
-    make: words[yearIndex + 1],
-    model: words[yearIndex + 2],
-  };
-}
-
 function normalizePrice(value) {
-  if (value === undefined || value === null) return null;
-
+  if (value === undefined || value === null || value === "") return null;
   const number = Number(String(value).replace(/[^\d.]/g, ""));
-
   return Number.isFinite(number) && number > 0 ? number : null;
 }
 
 function normalizeMileage(value) {
-  if (value === undefined || value === null) return null;
+  if (value === undefined || value === null || value === "") return null;
 
   if (typeof value === "object") {
-    value = value.value || value.valueReference || value.mileage;
+    value = value.value || value.mileage || value.miles;
   }
 
   const number = Number(String(value).replace(/[^\d.]/g, ""));
-
   return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
 function formatPrice(value) {
-  return `$${Number(value).toLocaleString("en-US", {
-    maximumFractionDigits: 0,
-  })}`;
+  return `$${Number(value).toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
 }
 
 function formatMileage(value) {
-  return Number(value).toLocaleString("en-US", {
-    maximumFractionDigits: 0,
-  });
+  return Number(value).toLocaleString("en-US", { maximumFractionDigits: 0 });
 }
 
-function pick(...values) {
-  return values.find(
-    (value) =>
-      value !== undefined &&
-      value !== null &&
-      value !== ""
-  );
+function cleanText(value) {
+  if (value === undefined || value === null) return null;
+  const result = String(value).replace(/\s+/g, " ").trim();
+  return result || null;
 }
 
-function absolutize(url, base) {
+function cleanUrl(value) {
+  const text = cleanText(value);
+  if (!text) return null;
+
   try {
-    return new URL(url, base).toString();
+    return new URL(text).toString();
   } catch {
     return null;
   }
 }
 
 function hashString(value) {
+  const input = String(value || "");
   let hash = 0;
 
-  for (let i = 0; i < value.length; i++) {
-    hash = (hash << 5) - hash + value.charCodeAt(i);
+  for (let i = 0; i < input.length; i++) {
+    hash = (hash << 5) - hash + input.charCodeAt(i);
     hash |= 0;
   }
 
@@ -787,10 +547,8 @@ function hashString(value) {
 
 function browserHeaders() {
   return {
-    "User-Agent":
-      "Mozilla/5.0 (compatible; GoldieInventoryWatcher/1.0)",
-    Accept:
-      "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+    "User-Agent": "Mozilla/5.0 (compatible; GoldieInventoryWatcher/2.0)",
+    Accept: "application/json,text/plain,*/*",
   };
 }
 
@@ -806,8 +564,6 @@ function escapeHtml(value) {
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
   });
 }
