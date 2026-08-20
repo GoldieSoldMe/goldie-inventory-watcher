@@ -16,10 +16,7 @@ export default {
       });
     }
 
-    if (url.pathname === "/run") {
-      if (!env.ADMIN_KEY || url.searchParams.get("key") !== env.ADMIN_KEY) {
-        return new Response("Unauthorized", { status: 401 });
-      }
+    if (url.pathname === "/run") 
 
       try {
         const result = await checkInventory(env, {
