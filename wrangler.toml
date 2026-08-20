@@ -16,4 +16,4 @@ ALERT_EMAIL = "goldiesoldme@gmail.com"
 
 [[kv_namespaces]]
 binding = "INVENTORY_KV"
-id = "PASTE_YOUR_KV_NAMESPACE_ID_HERE"
+id = "1733c36bce64412d97bfdb113a6ba905"
