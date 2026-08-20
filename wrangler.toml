@@ -8,12 +8,6 @@ crons = ["0 * * * *"]
 [vars]
 ALERT_EMAIL = "goldiesoldme@gmail.com"
 
-# Leave this commented out until the CLS inventory feed is identified:
-# INVENTORY_FEED_URL = "https://example.com/inventory-feed.json"
-
-# Once a sending domain is verified in Resend, you can add:
-# FROM_EMAIL = "Goldie Inventory <inventory@yourdomain.com>"
-
 [[kv_namespaces]]
 binding = "INVENTORY_KV"
 id = "1733c36bce64412d97bfdb113a6ba905"
