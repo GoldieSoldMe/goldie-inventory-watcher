@@ -7,6 +7,7 @@ crons = ["0 * * * *"]
 
 [vars]
 ALERT_EMAIL = "goldiesoldme@gmail.com"
+INVENTORY_FEED_URL = "https://fortcollins.clscars.com/wp-json/cls/v2/vehicles"
 
 [[kv_namespaces]]
 binding = "INVENTORY_KV"
