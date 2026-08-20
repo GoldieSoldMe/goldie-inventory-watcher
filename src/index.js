@@ -35,9 +35,7 @@ export default {
     }
 
     if (url.pathname === "/debug-source") {
-      if (!env.ADMIN_KEY || url.searchParams.get("key") !== env.ADMIN_KEY) {
-        return new Response("Unauthorized", { status: 401 });
-      }
+      
 
       const response = await fetch(INVENTORY_PAGE, {
         headers: browserHeaders(),
